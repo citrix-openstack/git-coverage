@@ -8,6 +8,9 @@ import subprocess
 import sys
 
 COVERAGE_EXTENSIONS = [".c", ".cpp", ".cc"]
+SKIP_PATTERNS = [
+        'assert_not_reached'
+]
 
 # Portions of the code:
 #
@@ -46,179 +49,155 @@ class BadPatch(Exception):
     def __str__(self):
         return self.message
 
-
-def get_patch_names(iter_lines):
-    try:
-        line = iter_lines.next()
-        if not line.startswith("--- "):
-            raise BadPatch("No orig name: %s" % line)
-        else:
-            orig_name = line[4:].rstrip("\n")
-    except StopIteration:
-        raise BadPatch("No orig line")
-    try:
-        line = iter_lines.next()
-        if not line.startswith("+++ "):
-            raise BadPatch("No mod name")
-        else:
-            mod_name = line[4:].rstrip("\n")
-    except StopIteration:
-        raise BadPatch("No mod line")
-    return (orig_name, mod_name)
-
-
-def parse_range(textrange):
-    tmp = textrange.split(',')
-    if len(tmp) == 1:
-        pos = tmp[0]
-        range = "1"
-    else:
-        (pos, range) = tmp
-    pos = int(pos)
-    range = int(range)
-    return (pos, range)
-
-
-def hunk_from_header(line):
-    matches = re.match(r'\@\@ ([^@]*) \@\@( (.*))?\n', line)
-    if matches is None:
-        raise MalformedHunkHeader("Does not match format.", line)
-    try:
-        (orig, mod) = matches.group(1).split(" ")
-    except (ValueError, IndexError), e:
-        raise MalformedHunkHeader(str(e), line)
-    if not orig.startswith('-') or not mod.startswith('+'):
-        raise MalformedHunkHeader("Positions don't start with + or -.", line)
-    try:
-        (orig_pos, orig_range) = parse_range(orig[1:])
-        (mod_pos, mod_range) = parse_range(mod[1:])
-    except (ValueError, IndexError), e:
-        raise MalformedHunkHeader(str(e), line)
-    if mod_range < 0 or orig_range < 0:
-        raise MalformedHunkHeader("Hunk range is negative", line)
-    tail = matches.group(3)
-    return Hunk(orig_pos, orig_range, mod_pos, mod_range, tail)
-
-
-class HunkLine:
-    def __init__(self, contents):
-        self.contents = contents
-
-
-class ContextLine(HunkLine):
-    def __init__(self, contents):
-        HunkLine.__init__(self, contents)
-
-
-class InsertLine(HunkLine):
-    def __init__(self, contents):
-        HunkLine.__init__(self, contents)
-
-
-class RemoveLine(HunkLine):
-    def __init__(self, contents):
-        HunkLine.__init__(self, contents)
-
-
-def parse_line(line):
-    if line.startswith("\n"):
-        return ContextLine(line)
-    elif line.startswith(" "):
-        return ContextLine(line[1:])
-    elif line.startswith("+"):
-        return InsertLine(line[1:])
-    elif line.startswith("-"):
-        return RemoveLine(line[1:])
-    else:
-        raise BadPatch("Unknown line type" % line)
-
-
 class Hunk:
-    def __init__(self, orig_pos, orig_range, mod_pos, mod_range, tail=None):
+    def __init__(self, orig_pos, orig_range, mod_pos, mod_range, header=None):
         self.orig_pos = orig_pos
         self.orig_range = orig_range
         self.mod_pos = mod_pos
         self.mod_range = mod_range
-        self.tail = tail
+        self.header = header
         self.lines = []
 
+    @staticmethod
+    def parse_range(textrange):
+        tmp = textrange.split(',')
+        if len(tmp) == 1:
+            pos = tmp[0]
+            range = "1"
+        else:
+            (pos, range) = tmp
+        pos = int(pos)
+        range = int(range)
+        return (pos, range)
 
-def iter_hunks(iter_lines, allow_dirty=False):
-    hunk = None
-    for line in iter_lines:
-        if line == "\n":
+    @staticmethod
+    def from_header(line):
+        matches = re.match(r'\@\@ ([^@]*) \@\@( (.*))?\n', line)
+        if matches is None:
+            raise MalformedHunkHeader("Does not match format.", line)
+        try:
+            (orig, mod) = matches.group(1).split(" ")
+        except (ValueError, IndexError), e:
+            raise MalformedHunkHeader(str(e), line)
+        if not orig.startswith('-') or not mod.startswith('+'):
+            raise MalformedHunkHeader("Positions don't start with + or -.", line)
+        try:
+            (orig_pos, orig_range) = Hunk.parse_range(orig[1:])
+            (mod_pos, mod_range) = Hunk.parse_range(mod[1:])
+        except (ValueError, IndexError), e:
+            raise MalformedHunkHeader(str(e), line)
+        if mod_range < 0 or orig_range < 0:
+            raise MalformedHunkHeader("Hunk range is negative", line)
+        tail = matches.group(3)
+        return Hunk(orig_pos, orig_range, mod_pos, mod_range, line)
+
+    @staticmethod
+    def parse(lines, allow_dirty=True):
+        hunk = None
+        lines = iter(lines)
+        for line in lines:
+            if line == "\n":
+                if hunk is not None:
+                    yield hunk
+                    hunk = None
+                continue
             if hunk is not None:
                 yield hunk
-                hunk = None
-            continue
+            try:
+                hunk = Hunk.from_header(line)
+            except MalformedHunkHeader:
+                if allow_dirty:
+                    # If the line isn't a hunk header, then we've reached the end
+                    # of this patch and there's "junk" at the end.  Ignore the
+                    # rest of this patch.
+                    return
+                raise
+            orig_size = 0
+            mod_size = 0
+            offset = hunk.mod_pos
+            while orig_size < hunk.orig_range or mod_size < hunk.mod_range:
+                hunk_line = lines.next()
+                if hunk_line.startswith("-"):
+                    orig_size += 1
+                elif hunk_line.startswith("\n"):
+                    orig_size += 1
+                    mod_size += 1
+                elif hunk_line.startswith(" "):
+                    orig_size += 1
+                    mod_size += 1
+                elif hunk_line.startswith("+"):
+                    mod_size += 1
+                else:
+                    raise BadPatch("Unknown line type: %s" % hunk_line)
+                hunk.lines.append((offset, hunk_line))
+                if not hunk_line.startswith("-"):
+                    offset += 1
         if hunk is not None:
             yield hunk
-        try:
-            hunk = hunk_from_header(line)
-        except MalformedHunkHeader:
-            if allow_dirty:
-                # If the line isn't a hunk header, then we've reached the end
-                # of this patch and there's "junk" at the end.  Ignore the
-                # rest of this patch.
-                return
-            raise
-        orig_size = 0
-        mod_size = 0
-        while orig_size < hunk.orig_range or mod_size < hunk.mod_range:
-            hunk_line = parse_line(iter_lines.next())
-            hunk.lines.append(hunk_line)
-            if isinstance(hunk_line, (RemoveLine, ContextLine)):
-                orig_size += 1
-            if isinstance(hunk_line, (InsertLine, ContextLine)):
-                mod_size += 1
-    if hunk is not None:
-        yield hunk
 
 
 class Patch(object):
     def __init__(self, oldname, newname):
         self.oldname = oldname
         self.newname = newname
+        self.prefix = []
         self.hunks = []
 
+    @staticmethod
+    def parse_one(lines, allow_dirty=True):
+        try:
+            first = lines.next()
+            if not first.startswith("--- "):
+                raise BadPatch("No orig name: %s" % first)
+            else:
+                orig_name = first[4:].rstrip("\n")
+        except StopIteration:
+            raise BadPatch("No orig line")
+        try:
+            second = lines.next()
+            if not second.startswith("+++ "):
+                raise BadPatch("No mod name")
+            else:
+                mod_name = second[4:].rstrip("\n")
+        except StopIteration:
+            raise BadPatch("No mod line")
 
-def parse_patch(iter_lines, allow_dirty=False):
-    (orig_name, mod_name) = get_patch_names(iter_lines)
-    patch = Patch(orig_name, mod_name)
-    for hunk in iter_hunks(iter_lines, allow_dirty):
-        patch.hunks.append(hunk)
-    return patch
+        patch = Patch(orig_name, mod_name)
+        for hunk in Hunk.parse(lines, allow_dirty):
+            patch.hunks.append(hunk)
+        patch.prefix = [first, second]
+        return patch
 
-
-def iter_file_patch(iter_lines, allow_dirty=False):
-    saved_lines = []
-    orig_range = 0
-    beginning = True
-    for line in iter_lines:
-        if BINARY_FILES_RE.match(line):
-            continue
-        if line.startswith('=== ') or line.startswith('*** '):
-            continue
-        if line.startswith('#'):
-            continue
-        elif orig_range > 0:
-            if line.startswith('-') or line.startswith(' '):
-                orig_range -= 1
-        elif line.startswith('--- '):
-            if allow_dirty and beginning:
-                # Patches can have "junk" at the beginning
-                # Stripping junk from the end of patches is handled when we
-                # parse the patch
-                beginning = False
-            elif len(saved_lines) > 0:
-                yield saved_lines
-            saved_lines = []
-        elif line.startswith('@@'):
-            hunk = hunk_from_header(line)
-            orig_range = hunk.orig_range
-        saved_lines.append(line)
-    if len(saved_lines) > 0:
-        yield saved_lines
+    @staticmethod
+    def parse(lines, allow_dirty=True):
+        saved_lines = []
+        orig_range = 0
+        beginning = True
+        for line in lines:
+            if BINARY_FILES_RE.match(line):
+                continue
+            if line.startswith('=== ') or line.startswith('*** '):
+                continue
+            if line.startswith('#'):
+                continue
+            elif orig_range > 0:
+                if line.startswith('-') or line.startswith(' '):
+                    orig_range -= 1
+            elif line.startswith('--- '):
+                if allow_dirty and beginning:
+                    # Patches can have "junk" at the beginning
+                    # Stripping junk from the end of patches is handled when we
+                    # parse the patch
+                    beginning = False
+                elif len(saved_lines) > 0:
+                    yield Patch.parse_one(iter(saved_lines), allow_dirty)
+                saved_lines = []
+            elif line.startswith('@@'):
+                hunk = Hunk.from_header(line)
+                orig_range = hunk.orig_range
+            saved_lines.append(line)
+        if len(saved_lines) > 0:
+            yield Patch.parse_one(iter(saved_lines), allow_dirty)
 
 
 #
@@ -234,23 +213,38 @@ def iter_process_lines(argv):
         else:
             return
 
-def iter_desired_coverage(iter_lines):
-    for fil in iter_file_patch(iter_lines, allow_dirty=True):
-        patch = parse_patch(fil.__iter__(), allow_dirty=True)
-        filename = os.path.normpath(patch.newname.split("/", 1)[1])
-        (root, ext) = os.path.splitext(filename)
-        if ext not in COVERAGE_EXTENSIONS:
-            continue
-        for hunk in patch.hunks:
-            offset = hunk.mod_pos
-            for line in hunk.lines:
-                if isinstance(line, RemoveLine):
-                    yield (filename, offset, line.contents)
-                elif isinstance(line, InsertLine):
-                    yield (filename, offset, line.contents)
-                    offset += 1
-                else:
-                    offset += 1
+def ensure_gcda_file(gcno):
+    (base, ext) = os.path.splitext(gcno)
+    gcda = base + ".gcda"
+
+    # From gcov-io.h
+    #   The basic format of the files is
+    #
+    #   file : int32:magic int32:version int32:stamp record*
+    #
+    # magic for gcno files is 'gcno' as an integer, big or little endian
+    # and for gcda files it is 'gcda'
+
+    if os.path.exists(gcda):
+        return True
+
+    return False
+
+    # with open(gcno, 'r') as fi:
+    #       bytes = fi.read(12)
+    # if len(bytes) != 12:
+    #       return False
+    # if bytes[0:4] == 'gcno':
+    #       bytes = 'gcda' + bytes[4:]
+    # elif bytes[0:4] == 'oncg':
+    #       bytes = 'adcg' + bytes[4:]
+    # else:
+    #       print "bad", bytes[0:4]
+    #       return False
+    # with open(gcda, 'w') as fo:
+    #       fo.write(bytes)
+    # return True
+
 
 def find_all_gcno_files(directory):
     paths = []
@@ -261,10 +255,8 @@ def find_all_gcno_files(directory):
                 continue
             if not fnmatch.fnmatch(name, "*.gcno"):
                 continue
-            (base, ext) = os.path.splitext(path)
-            if not os.path.exists(base + ".gcda"):
-                continue
-            paths.append(path)
+            if ensure_gcda_file(path):
+                paths.append(path)
     os.path.walk(".", visit, paths)
     return paths
 
@@ -343,42 +335,121 @@ def gcov_coverage_lines(gcov_iter):
             pass
     return coverage
 
+class Output:
+    defaults = {
+            'diff.new': 'green',
+            'diff.meta': 'bold',
+            'diff.plain': 'normal',
+            'diff.frag': 'cyan',
+            'diff.old': 'red',
+            'diff.whitespace': 'normal red',
+            'diff.problem': 'normal red'
+    }
+
+    def __init__(self, output):
+        self.output = output
+        self.escapes = { }
+
+        cmd = ['git', 'config', '--get-colorbool',
+               'color.diff', output.isatty() and 'true' or 'false']
+        self.with_colors = subprocess.check_output(cmd).strip() == 'true'
+
+    def write_meta(self, data, meta):
+        if not self.with_colors:
+            pass
+        elif not meta:
+            self.output.write('\033[0m')
+        elif meta in self.escapes:
+            self.output.write(self.escapes[meta])
+        else:
+            default = self.defaults.get(meta, 'normal')
+            cmd = ['git', 'config', '--get-color', "color.%s" % meta, default]
+            escape = subprocess.check_output(cmd)
+            self.output.write(escape)
+            self.escapes[meta] = escape
+        self.write(data)
+        if self.with_colors:
+            self.output.write('\033[0m')
+
+    def write(self, data):
+        self.output.write(data)
+
+def print_patch_hunks(patch, hunks, coverage, output):
+    for line in patch.prefix:
+        output.write_meta(line, 'diff.meta')
+    for hunk in hunks:
+        output.write_meta(hunk.header, 'diff.frag')
+        for (no, line) in hunk.lines:
+            if no in coverage:
+                output.write(" ")
+            else:
+                output.write_meta("!", 'diff.problem')
+            if line.startswith("-"):
+                output.write_meta(line, 'diff.old')
+            elif line.startswith("+"):
+                output.write_meta(line, 'diff.new')
+            else:
+                output.write_meta(line, 'diff.plain')
+
+def is_hunk_covered(hunk, coverage, patterns):
+    for (no, contents) in hunk.lines:
+        if no not in coverage:
+            for pattern in patterns:
+                data = contents[1:].strip()
+                if pattern.search(data):
+                    break
+            else:
+                return False
+    return True
+
 
 def main(argv):
-    try:
-        opts, args = getopt.getopt(argv[1:], "h", ["help"])
-    except getopt.GetoptError, err:
-        print str(err)
-        return 2
-    for o, a in opts:
-        if o in ("-h", "--help"):
-            usage()
-            return 0
-        else:
-            assert False, "unhandled option"
+    have_target = False
+    for arg in argv[1:]:
+        if not arg.startswith("-"):
+            have_target = True
+            break;
 
-    if len(args) == 0:
-        cmd = ['git', 'diff', 'HEAD']
+    if have_target:
+        cmd = ['git', 'diff'] + argv[1:]
     else:
-        cmd = ['git', 'show'] + args
+        cmd = ['git', 'diff', 'HEAD']
 
-    # First process all the lines that we need
-    needed_coverage = { }
-    iterator = iter_process_lines(cmd)
-    for (filename, no, content) in iter_desired_coverage(iterator):
-        if filename not in needed_coverage:
-            needed_coverage[filename] = { }
-        needed_coverage[filename][no] = content
+    printed_any = 0
+    output = Output(sys.stdout)
+    patches_by_filename = { }
 
+    # Pull all the patches appart into the hunks that we need
+    for patch in Patch.parse(iter_process_lines(cmd)):
+        (name, ext) = os.path.splitext(patch.newname)
+        if ext not in COVERAGE_EXTENSIONS:
+            continue
+        filename = os.path.normpath(patch.newname.split("/", 1)[1])
+        if filename not in patches_by_filename:
+            patches_by_filename[filename] = []
+        patches_by_filename[filename].append(patch)
+
+    # Find all the gcno files in the directory
     gcno_cache = find_all_gcno_files(".")
 
-    for (filename, needed) in needed_coverage.items():
+    # Compile all the skip patterns
+    patterns = [re.compile(p) for p in SKIP_PATTERNS]
+
+    # Now go through and calculate coverage
+    for (filename, patches) in patches_by_filename.items():
         gcov = gcov_lines_for_files(filename, gcno_cache)
         coverage = gcov_coverage_lines(gcov)
 
-        for (no, content) in needed.items():
-            if no not in coverage:
-                print filename, no, content,
+        for patch in patches:
+            to_print = []
+            for hunk in patch.hunks:
+                if not is_hunk_covered(hunk, coverage, patterns):
+                    to_print.append(hunk)
+            if to_print:
+                print_patch_hunks(patch, to_print, coverage, output)
+                printed_any = 1
+
+    return printed_any
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))

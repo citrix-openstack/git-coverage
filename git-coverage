@@ -12,7 +12,19 @@ SKIP_PATTERNS = [
         'assert_not_reached'
 ]
 
-# Portions of the code:
+def subprocess_lines(argv):
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE)
+    while True:
+        line = proc.stdout.readline()
+        if line != "":
+            yield line
+        else:
+            return
+
+# ----------------------------------------------------------------------------
+# PATCH PARSING
+#
+# The patch parsing code, heavily modified originated from:
 #
 # Copyright (C) 2005-2010 Aaron Bentley, Canonical Ltd
 # <aaron.bentley@utoronto.ca>
@@ -31,16 +43,6 @@ SKIP_PATTERNS = [
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 #
-
-BINARY_FILES_RE = re.compile('Binary files (.*) and (.*) differ\n')
-
-class MalformedHunkHeader(Exception):
-    def __init__(self, desc, line):
-        self.desc = desc
-        self.line = line
-
-    def __str__(self):
-        return "Malformed hunk header.  %(desc)s\n%(line)r" % self.__dict__
 
 class BadPatch(Exception):
     def __init(self, message):
@@ -74,25 +76,25 @@ class Hunk:
     def from_header(line):
         matches = re.match(r'\@\@ ([^@]*) \@\@( (.*))?\n', line)
         if matches is None:
-            raise MalformedHunkHeader("Does not match format.", line)
+            raise BadPatch("Does not match format.", line)
         try:
             (orig, mod) = matches.group(1).split(" ")
         except (ValueError, IndexError), e:
-            raise MalformedHunkHeader(str(e), line)
+            raise BadPatch(str(e), line)
         if not orig.startswith('-') or not mod.startswith('+'):
-            raise MalformedHunkHeader("Positions don't start with + or -.", line)
+            raise BadPatch("Positions don't start with + or -.", line)
         try:
             (orig_pos, orig_range) = Hunk.parse_range(orig[1:])
             (mod_pos, mod_range) = Hunk.parse_range(mod[1:])
         except (ValueError, IndexError), e:
-            raise MalformedHunkHeader(str(e), line)
+            raise BadPatch(str(e), line)
         if mod_range < 0 or orig_range < 0:
-            raise MalformedHunkHeader("Hunk range is negative", line)
+            raise BadPatch("Hunk range is negative", line)
         tail = matches.group(3)
         return Hunk(orig_pos, orig_range, mod_pos, mod_range, line)
 
     @staticmethod
-    def parse(lines, allow_dirty=True):
+    def parse(lines):
         hunk = None
         lines = iter(lines)
         for line in lines:
@@ -105,13 +107,11 @@ class Hunk:
                 yield hunk
             try:
                 hunk = Hunk.from_header(line)
-            except MalformedHunkHeader:
-                if allow_dirty:
-                    # If the line isn't a hunk header, then we've reached the end
-                    # of this patch and there's "junk" at the end.  Ignore the
-                    # rest of this patch.
-                    return
-                raise
+            except BadPatch:
+                # If the line isn't a hunk header, then we've reached the end
+                # of this patch and there's "junk" at the end.  Ignore the
+                # rest of this patch.
+                return
             orig_size = 0
             mod_size = 0
             offset = hunk.mod_pos
@@ -137,6 +137,8 @@ class Hunk:
 
 
 class Patch(object):
+    BINARY_FILES_RE = re.compile('Binary files (.*) and (.*) differ\n')
+
     def __init__(self, oldname, newname):
         self.oldname = oldname
         self.newname = newname
@@ -144,7 +146,7 @@ class Patch(object):
         self.hunks = []
 
     @staticmethod
-    def parse_one(lines, allow_dirty=True):
+    def parse_one(lines):
         try:
             first = lines.next()
             if not first.startswith("--- "):
@@ -163,18 +165,18 @@ class Patch(object):
             raise BadPatch("No mod line")
 
         patch = Patch(orig_name, mod_name)
-        for hunk in Hunk.parse(lines, allow_dirty):
+        for hunk in Hunk.parse(lines):
             patch.hunks.append(hunk)
         patch.prefix = [first, second]
         return patch
 
     @staticmethod
-    def parse(lines, allow_dirty=True):
+    def parse(lines):
         saved_lines = []
         orig_range = 0
         beginning = True
         for line in lines:
-            if BINARY_FILES_RE.match(line):
+            if Patch.BINARY_FILES_RE.match(line):
                 continue
             if line.startswith('=== ') or line.startswith('*** '):
                 continue
@@ -184,34 +186,24 @@ class Patch(object):
                 if line.startswith('-') or line.startswith(' '):
                     orig_range -= 1
             elif line.startswith('--- '):
-                if allow_dirty and beginning:
+                if beginning:
                     # Patches can have "junk" at the beginning
                     # Stripping junk from the end of patches is handled when we
                     # parse the patch
                     beginning = False
                 elif len(saved_lines) > 0:
-                    yield Patch.parse_one(iter(saved_lines), allow_dirty)
+                    yield Patch.parse_one(iter(saved_lines))
                 saved_lines = []
             elif line.startswith('@@'):
                 hunk = Hunk.from_header(line)
                 orig_range = hunk.orig_range
             saved_lines.append(line)
         if len(saved_lines) > 0:
-            yield Patch.parse_one(iter(saved_lines), allow_dirty)
+            yield Patch.parse_one(iter(saved_lines))
 
 
-#
-# End of code from bzr
-# ---------------------------------------------------------------------------
-
-def iter_process_lines(argv):
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE)
-    while True:
-        line = proc.stdout.readline()
-        if line != "":
-            yield line
-        else:
-            return
+# ----------------------------------------------------------------------------
+# COVERAGE PARSERS
 
 class GccCoverage:
     extensions = [".c", ".cpp", ".cc"]
@@ -263,7 +255,7 @@ class GccCoverage:
         gcovs = []
 
         cmd = ['gcov', '--preserve-paths', '--relative-only']
-        for line in iter_process_lines(cmd + absgcno):
+        for line in subprocess_lines(cmd + absgcno):
             match = self._creating_re.match(line)
             if not match:
                 continue
@@ -302,6 +294,21 @@ class GccCoverage:
             except ValueError:
                 pass
         return coverage
+
+    def usage(self, output):
+        string = """GCC gcov C code coverage
+
+             Used with: %s
+
+             The program should be (re)built with the specicial GCC options
+             '-fprofile-arcs -ftest-coverage'. Run the C applications as you
+             normally would to create test coverage data.
+        """
+
+        message = string % ", ".join(self.extensions)
+        message = message.replace("\t", "")
+        output.write(message)
+
 
 class PythonCoverage:
     extensions = [".py"]
@@ -342,6 +349,21 @@ class PythonCoverage:
 
         return coverage
 
+    def usage(self, output):
+        string = """Python code coverage
+
+             Used with: %s
+
+             This requires the python-coverage module. The program should be
+             run with 'coverage run my_program.py' which produces test coverage
+             data in the current directory.
+        """
+
+        message = string % ", ".join(self.extensions)
+        message = message.replace("\t", "")
+        output.write(message)
+
+
 class Output:
     defaults = {
             'diff.new': 'green',
@@ -381,6 +403,9 @@ class Output:
     def write(self, data):
         self.output.write(data)
 
+
+# ----------------------------------------------------------------------------
+
 def print_patch_hunks(patch, hunks, coverage, output):
     for line in patch.prefix:
         output.write_meta(line, 'diff.meta')
@@ -410,29 +435,47 @@ def is_hunk_covered(hunk, coverage, patterns):
     return True
 
 
+def usage(parsers, output=sys.stdout):
+    string = """usage: git coverage [diff-options] commit
+
+    Shows the code coverage for code changed between the specified commit and
+    the latest code. Use standard git diff options to specify which commits
+    to include in the code.
+    """
+    message = string.replace("\t", "")
+    output.write(message)
+    for parser in parsers:
+        output.write("\n")
+        parser.usage(output=output)
+
+
 def main(argv):
-    have_target = False
-    for arg in argv[1:]:
-        if not arg.startswith("-"):
-            have_target = True
-            break;
-
-    if have_target:
-        cmd = ['git', 'diff'] + argv[1:]
-    else:
-        cmd = ['git', 'diff', 'HEAD']
-
-    output = Output(sys.stdout)
     parsers = (
             GccCoverage(),
             PythonCoverage()
     )
 
+    have_target = False
+    for arg in argv[1:]:
+        if arg in ('-h', '--help'):
+            usage(parsers)
+            return 0
+
+        if not arg.startswith("-"):
+            have_target = True
+            break
+
+    cmd = ['git', 'diff'] + argv[1:]
+    if not have_target:
+        cmd += ['HEAD']
+
+    output = Output(sys.stdout)
+
     printed_any = 0
     patches_by_filename = { }
 
     # Pull all the patches appart into the hunks that we need
-    for patch in Patch.parse(iter_process_lines(cmd)):
+    for patch in Patch.parse(subprocess_lines(cmd)):
         filename = os.path.normpath(patch.newname.split("/", 1)[1])
         if filename not in patches_by_filename:
             patches_by_filename[filename] = []
@@ -461,6 +504,7 @@ def main(argv):
                 printed_any = 1
 
     return printed_any
+
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))

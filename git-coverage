@@ -1,0 +1,384 @@
+#!/usr/bin/env python
+
+import fnmatch
+import getopt
+import os
+import re
+import subprocess
+import sys
+
+COVERAGE_EXTENSIONS = [".c", ".cpp", ".cc"]
+
+# Portions of the code:
+#
+# Copyright (C) 2005-2010 Aaron Bentley, Canonical Ltd
+# <aaron.bentley@utoronto.ca>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+#
+
+BINARY_FILES_RE = re.compile('Binary files (.*) and (.*) differ\n')
+
+class MalformedHunkHeader(Exception):
+    def __init__(self, desc, line):
+        self.desc = desc
+        self.line = line
+
+    def __str__(self):
+        return "Malformed hunk header.  %(desc)s\n%(line)r" % self.__dict__
+
+class BadPatch(Exception):
+    def __init(self, message):
+        self.message = message
+
+    def __str__(self):
+        return self.message
+
+
+def get_patch_names(iter_lines):
+    try:
+        line = iter_lines.next()
+        if not line.startswith("--- "):
+            raise BadPatch("No orig name: %s" % line)
+        else:
+            orig_name = line[4:].rstrip("\n")
+    except StopIteration:
+        raise BadPatch("No orig line")
+    try:
+        line = iter_lines.next()
+        if not line.startswith("+++ "):
+            raise BadPatch("No mod name")
+        else:
+            mod_name = line[4:].rstrip("\n")
+    except StopIteration:
+        raise BadPatch("No mod line")
+    return (orig_name, mod_name)
+
+
+def parse_range(textrange):
+    tmp = textrange.split(',')
+    if len(tmp) == 1:
+        pos = tmp[0]
+        range = "1"
+    else:
+        (pos, range) = tmp
+    pos = int(pos)
+    range = int(range)
+    return (pos, range)
+
+
+def hunk_from_header(line):
+    matches = re.match(r'\@\@ ([^@]*) \@\@( (.*))?\n', line)
+    if matches is None:
+        raise MalformedHunkHeader("Does not match format.", line)
+    try:
+        (orig, mod) = matches.group(1).split(" ")
+    except (ValueError, IndexError), e:
+        raise MalformedHunkHeader(str(e), line)
+    if not orig.startswith('-') or not mod.startswith('+'):
+        raise MalformedHunkHeader("Positions don't start with + or -.", line)
+    try:
+        (orig_pos, orig_range) = parse_range(orig[1:])
+        (mod_pos, mod_range) = parse_range(mod[1:])
+    except (ValueError, IndexError), e:
+        raise MalformedHunkHeader(str(e), line)
+    if mod_range < 0 or orig_range < 0:
+        raise MalformedHunkHeader("Hunk range is negative", line)
+    tail = matches.group(3)
+    return Hunk(orig_pos, orig_range, mod_pos, mod_range, tail)
+
+
+class HunkLine:
+    def __init__(self, contents):
+        self.contents = contents
+
+
+class ContextLine(HunkLine):
+    def __init__(self, contents):
+        HunkLine.__init__(self, contents)
+
+
+class InsertLine(HunkLine):
+    def __init__(self, contents):
+        HunkLine.__init__(self, contents)
+
+
+class RemoveLine(HunkLine):
+    def __init__(self, contents):
+        HunkLine.__init__(self, contents)
+
+
+def parse_line(line):
+    if line.startswith("\n"):
+        return ContextLine(line)
+    elif line.startswith(" "):
+        return ContextLine(line[1:])
+    elif line.startswith("+"):
+        return InsertLine(line[1:])
+    elif line.startswith("-"):
+        return RemoveLine(line[1:])
+    else:
+        raise BadPatch("Unknown line type" % line)
+
+
+class Hunk:
+    def __init__(self, orig_pos, orig_range, mod_pos, mod_range, tail=None):
+        self.orig_pos = orig_pos
+        self.orig_range = orig_range
+        self.mod_pos = mod_pos
+        self.mod_range = mod_range
+        self.tail = tail
+        self.lines = []
+
+
+def iter_hunks(iter_lines, allow_dirty=False):
+    hunk = None
+    for line in iter_lines:
+        if line == "\n":
+            if hunk is not None:
+                yield hunk
+                hunk = None
+            continue
+        if hunk is not None:
+            yield hunk
+        try:
+            hunk = hunk_from_header(line)
+        except MalformedHunkHeader:
+            if allow_dirty:
+                # If the line isn't a hunk header, then we've reached the end
+                # of this patch and there's "junk" at the end.  Ignore the
+                # rest of this patch.
+                return
+            raise
+        orig_size = 0
+        mod_size = 0
+        while orig_size < hunk.orig_range or mod_size < hunk.mod_range:
+            hunk_line = parse_line(iter_lines.next())
+            hunk.lines.append(hunk_line)
+            if isinstance(hunk_line, (RemoveLine, ContextLine)):
+                orig_size += 1
+            if isinstance(hunk_line, (InsertLine, ContextLine)):
+                mod_size += 1
+    if hunk is not None:
+        yield hunk
+
+
+class Patch(object):
+    def __init__(self, oldname, newname):
+        self.oldname = oldname
+        self.newname = newname
+        self.hunks = []
+
+
+def parse_patch(iter_lines, allow_dirty=False):
+    (orig_name, mod_name) = get_patch_names(iter_lines)
+    patch = Patch(orig_name, mod_name)
+    for hunk in iter_hunks(iter_lines, allow_dirty):
+        patch.hunks.append(hunk)
+    return patch
+
+
+def iter_file_patch(iter_lines, allow_dirty=False):
+    saved_lines = []
+    orig_range = 0
+    beginning = True
+    for line in iter_lines:
+        if BINARY_FILES_RE.match(line):
+            continue
+        if line.startswith('=== ') or line.startswith('*** '):
+            continue
+        if line.startswith('#'):
+            continue
+        elif orig_range > 0:
+            if line.startswith('-') or line.startswith(' '):
+                orig_range -= 1
+        elif line.startswith('--- '):
+            if allow_dirty and beginning:
+                # Patches can have "junk" at the beginning
+                # Stripping junk from the end of patches is handled when we
+                # parse the patch
+                beginning = False
+            elif len(saved_lines) > 0:
+                yield saved_lines
+            saved_lines = []
+        elif line.startswith('@@'):
+            hunk = hunk_from_header(line)
+            orig_range = hunk.orig_range
+        saved_lines.append(line)
+    if len(saved_lines) > 0:
+        yield saved_lines
+
+
+#
+# End of code from bzr
+# ---------------------------------------------------------------------------
+
+def iter_process_lines(argv):
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE)
+    while True:
+        line = proc.stdout.readline()
+        if line != "":
+            yield line
+        else:
+            return
+
+def iter_desired_coverage(iter_lines):
+    for fil in iter_file_patch(iter_lines, allow_dirty=True):
+        patch = parse_patch(fil.__iter__(), allow_dirty=True)
+        filename = os.path.normpath(patch.newname.split("/", 1)[1])
+        (root, ext) = os.path.splitext(filename)
+        if ext not in COVERAGE_EXTENSIONS:
+            continue
+        for hunk in patch.hunks:
+            offset = hunk.mod_pos
+            for line in hunk.lines:
+                if isinstance(line, RemoveLine):
+                    yield (filename, offset, line.contents)
+                elif isinstance(line, InsertLine):
+                    yield (filename, offset, line.contents)
+                    offset += 1
+                else:
+                    offset += 1
+
+def find_all_gcno_files(directory):
+    paths = []
+    def visit(paths, dirname, names):
+        for name in names:
+            path = os.path.normpath(os.path.join(dirname, name))
+            if os.path.isdir(path):
+                continue
+            if not fnmatch.fnmatch(name, "*.gcno"):
+                continue
+            (base, ext) = os.path.splitext(path)
+            if not os.path.exists(base + ".gcda"):
+                continue
+            paths.append(path)
+    os.path.walk(".", visit, paths)
+    return paths
+
+
+def match_gcno_files(filename, gcno_cache):
+    matches = []
+    (directory, base) = os.path.split(filename)
+    (base, ext) = os.path.splitext(base)
+    match = "%s/*%s.gcno" % (directory, base)
+    for gcno in gcno_cache:
+        if fnmatch.fnmatch(gcno, match):
+            matches.append(gcno)
+    return matches
+
+CREATING_RE = re.compile(".*'(.+\.gcov)'.*")
+
+def gcov_lines_for_files(filename, gcno_cache):
+    gcno = match_gcno_files(filename, gcno_cache)
+    if not gcno:
+        return
+
+    # gcov wants to be in the directory with the source files
+    # so we make all the gcno paths absolute and change to that
+    # directory
+
+    absgcno = [os.path.abspath(path) for path in gcno]
+    (directory, base) = os.path.split(filename)
+
+    oldpwd = os.getcwd()
+    os.chdir(directory)
+
+    # We scrape the output of the command for the names of the
+    # gcov files created, which we process, and then remove
+    gcovs = []
+
+    cmd = ['gcov', '--preserve-paths', '--relative-only']
+    for line in iter_process_lines(cmd + absgcno):
+        match = CREATING_RE.match(line)
+        if not match:
+            continue
+        gcov = match.group(1)
+        if os.path.exists(gcov):
+            gcovs.append(os.path.abspath(gcov))
+
+    # Because we change the directory, we have to take care not
+    # to yield while the current directory is changed
+
+    os.chdir(oldpwd)
+
+    for gcov in gcovs:
+        with open(gcov, 'r') as f:
+            for l in f:
+                yield l
+            os.unlink(gcov)
+
+
+def gcov_coverage_lines(gcov_iter):
+    coverage = { }
+    for line in gcov_iter:
+
+        # Each gcov coverage output line looks something like this
+        #  coverage:   lineno:  remainder is actual line content
+        parts = line.split(':', 2)
+        if len(parts) != 3:
+            continue
+
+        covered = parts[0].strip()
+        try:
+            no = int(parts[1].strip())
+            if covered == '-':
+                count = 0
+            else:
+                count = int(covered)
+            coverage[no] = parts[2]
+        except ValueError:
+            pass
+    return coverage
+
+
+def main(argv):
+    try:
+        opts, args = getopt.getopt(argv[1:], "h", ["help"])
+    except getopt.GetoptError, err:
+        print str(err)
+        return 2
+    for o, a in opts:
+        if o in ("-h", "--help"):
+            usage()
+            return 0
+        else:
+            assert False, "unhandled option"
+
+    if len(args) == 0:
+        cmd = ['git', 'diff', 'HEAD']
+    else:
+        cmd = ['git', 'show'] + args
+
+    # First process all the lines that we need
+    needed_coverage = { }
+    iterator = iter_process_lines(cmd)
+    for (filename, no, content) in iter_desired_coverage(iterator):
+        if filename not in needed_coverage:
+            needed_coverage[filename] = { }
+        needed_coverage[filename][no] = content
+
+    gcno_cache = find_all_gcno_files(".")
+
+    for (filename, needed) in needed_coverage.items():
+        gcov = gcov_lines_for_files(filename, gcno_cache)
+        coverage = gcov_coverage_lines(gcov)
+
+        for (no, content) in needed.items():
+            if no not in coverage:
+                print filename, no, content,
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

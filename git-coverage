@@ -6,8 +6,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
-COVERAGE_EXTENSIONS = [".c", ".cpp", ".cc"]
 SKIP_PATTERNS = [
         'assert_not_reached'
 ]
@@ -213,127 +213,134 @@ def iter_process_lines(argv):
         else:
             return
 
-def ensure_gcda_file(gcno):
-    (base, ext) = os.path.splitext(gcno)
-    gcda = base + ".gcda"
+class GccCoverage:
+    extensions = [".c", ".cpp", ".cc"]
 
-    # From gcov-io.h
-    #   The basic format of the files is
-    #
-    #   file : int32:magic int32:version int32:stamp record*
-    #
-    # magic for gcno files is 'gcno' as an integer, big or little endian
-    # and for gcda files it is 'gcda'
+    def __init__(self):
+        self._gcno_cache = []
+        self._creating_re = re.compile(".*'(.+\.gcov)'.*")
 
-    if os.path.exists(gcda):
-        return True
+        def visit(paths, dirname, names):
+            for name in names:
+                path = os.path.normpath(os.path.join(dirname, name))
+                if os.path.isdir(path):
+                    continue
+                if not fnmatch.fnmatch(name, "*.gcno"):
+                    continue
+                # Skip if no gcda file for this gcno file
+                (base, ext) = os.path.splitext(path)
+                if os.path.exists(base + ".gcda"):
+                    paths.append(path)
+        os.path.walk(".", visit, self._gcno_cache)
 
-    return False
+    def _match_gcno_files(self, filename):
+        matches = []
+        (directory, base) = os.path.split(filename)
+        (base, ext) = os.path.splitext(base)
+        match = "%s/*%s.gcno" % (directory, base)
+        for gcno in self._gcno_cache:
+            if fnmatch.fnmatch(gcno, match):
+                matches.append(gcno)
+        return matches
 
-    # with open(gcno, 'r') as fi:
-    #       bytes = fi.read(12)
-    # if len(bytes) != 12:
-    #       return False
-    # if bytes[0:4] == 'gcno':
-    #       bytes = 'gcda' + bytes[4:]
-    # elif bytes[0:4] == 'oncg':
-    #       bytes = 'adcg' + bytes[4:]
-    # else:
-    #       print "bad", bytes[0:4]
-    #       return False
-    # with open(gcda, 'w') as fo:
-    #       fo.write(bytes)
-    # return True
+    def _gcov_lines_for_files(self, filename):
+        gcno = self._match_gcno_files(filename)
+        if not gcno:
+            return
 
+        # gcov wants to be in the directory with the source files
+        # so we make all the gcno paths absolute and change to that
+        # directory
 
-def find_all_gcno_files(directory):
-    paths = []
-    def visit(paths, dirname, names):
-        for name in names:
-            path = os.path.normpath(os.path.join(dirname, name))
-            if os.path.isdir(path):
+        absgcno = [os.path.abspath(path) for path in gcno]
+        (directory, base) = os.path.split(filename)
+
+        oldpwd = os.getcwd()
+        os.chdir(directory)
+
+        # We scrape the output of the command for the names of the
+        # gcov files created, which we process, and then remove
+        gcovs = []
+
+        cmd = ['gcov', '--preserve-paths', '--relative-only']
+        for line in iter_process_lines(cmd + absgcno):
+            match = self._creating_re.match(line)
+            if not match:
                 continue
-            if not fnmatch.fnmatch(name, "*.gcno"):
+            gcov = match.group(1)
+            if os.path.exists(gcov):
+                gcovs.append(os.path.abspath(gcov))
+
+        # Because we change the directory, we have to take care not
+        # to yield while the current directory is changed
+
+        os.chdir(oldpwd)
+
+        for gcov in gcovs:
+            with open(gcov, 'r') as f:
+                for l in f:
+                    yield l
+                os.unlink(gcov)
+
+    def coverage(self, filename):
+        coverage = { }
+        for line in self._gcov_lines_for_files(filename):
+            # Each gcov coverage output line looks something like this
+            #  coverage:   lineno:  remainder is actual line content
+            parts = line.split(':', 2)
+            if len(parts) != 3:
                 continue
-            if ensure_gcda_file(path):
-                paths.append(path)
-    os.path.walk(".", visit, paths)
-    return paths
 
+            covered = parts[0].strip()
+            try:
+                no = int(parts[1].strip())
+                if covered == '-':
+                    count = 0
+                else:
+                    count = int(covered)
+                coverage[no] = parts[2]
+            except ValueError:
+                pass
+        return coverage
 
-def match_gcno_files(filename, gcno_cache):
-    matches = []
-    (directory, base) = os.path.split(filename)
-    (base, ext) = os.path.splitext(base)
-    match = "%s/*%s.gcno" % (directory, base)
-    for gcno in gcno_cache:
-        if fnmatch.fnmatch(gcno, match):
-            matches.append(gcno)
-    return matches
+class PythonCoverage:
+    extensions = [".py"]
 
-CREATING_RE = re.compile(".*'(.+\.gcov)'.*")
+    def __init__(self):
+        self._temp_dir = tempfile.mkdtemp(prefix='git-coverage')
 
-def gcov_lines_for_files(filename, gcno_cache):
-    gcno = match_gcno_files(filename, gcno_cache)
-    if not gcno:
-        return
+    def __del__(self):
+        for path in self._list_files():
+            os.unlink(path)
+        os.rmdir(self._temp_dir)
 
-    # gcov wants to be in the directory with the source files
-    # so we make all the gcno paths absolute and change to that
-    # directory
+    def _list_files(self):
+        for name in os.listdir(self._temp_dir):
+            if fnmatch.fnmatch(name, "*,cover"):
+                yield os.path.join(self._temp_dir, name)
 
-    absgcno = [os.path.abspath(path) for path in gcno]
-    (directory, base) = os.path.split(filename)
+    def _read_coverage(self, filename):
+        coverage = { }
+        no = 1
+        for line in open(filename, 'r'):
+            if not line.startswith("!"):
+                coverage[no] = line
+            no += 1
+        return coverage
 
-    oldpwd = os.getcwd()
-    os.chdir(directory)
+    def coverage(self, filename):
+        cmd = ["coverage", "annotate", "--directory", self._temp_dir, filename]
+        subprocess.check_call(cmd)
 
-    # We scrape the output of the command for the names of the
-    # gcov files created, which we process, and then remove
-    gcovs = []
+        coverage = { }
+        base = os.path.basename(filename)
 
-    cmd = ['gcov', '--preserve-paths', '--relative-only']
-    for line in iter_process_lines(cmd + absgcno):
-        match = CREATING_RE.match(line)
-        if not match:
-            continue
-        gcov = match.group(1)
-        if os.path.exists(gcov):
-            gcovs.append(os.path.abspath(gcov))
+        for path in self._list_files():
+            if not coverage and fnmatch.fnmatch(path, "*_%s,cover" % base):
+                coverage = self._read_coverage(path)
+            os.unlink(path)
 
-    # Because we change the directory, we have to take care not
-    # to yield while the current directory is changed
-
-    os.chdir(oldpwd)
-
-    for gcov in gcovs:
-        with open(gcov, 'r') as f:
-            for l in f:
-                yield l
-            os.unlink(gcov)
-
-
-def gcov_coverage_lines(gcov_iter):
-    coverage = { }
-    for line in gcov_iter:
-
-        # Each gcov coverage output line looks something like this
-        #  coverage:   lineno:  remainder is actual line content
-        parts = line.split(':', 2)
-        if len(parts) != 3:
-            continue
-
-        covered = parts[0].strip()
-        try:
-            no = int(parts[1].strip())
-            if covered == '-':
-                count = 0
-            else:
-                count = int(covered)
-            coverage[no] = parts[2]
-        except ValueError:
-            pass
-    return coverage
+        return coverage
 
 class Output:
     defaults = {
@@ -415,30 +422,34 @@ def main(argv):
     else:
         cmd = ['git', 'diff', 'HEAD']
 
-    printed_any = 0
     output = Output(sys.stdout)
+    parsers = (
+            GccCoverage(),
+            PythonCoverage()
+    )
+
+    printed_any = 0
     patches_by_filename = { }
 
     # Pull all the patches appart into the hunks that we need
     for patch in Patch.parse(iter_process_lines(cmd)):
-        (name, ext) = os.path.splitext(patch.newname)
-        if ext not in COVERAGE_EXTENSIONS:
-            continue
         filename = os.path.normpath(patch.newname.split("/", 1)[1])
         if filename not in patches_by_filename:
             patches_by_filename[filename] = []
         patches_by_filename[filename].append(patch)
-
-    # Find all the gcno files in the directory
-    gcno_cache = find_all_gcno_files(".")
 
     # Compile all the skip patterns
     patterns = [re.compile(p) for p in SKIP_PATTERNS]
 
     # Now go through and calculate coverage
     for (filename, patches) in patches_by_filename.items():
-        gcov = gcov_lines_for_files(filename, gcno_cache)
-        coverage = gcov_coverage_lines(gcov)
+        (name, ext) = os.path.splitext(filename)
+        for parser in parsers:
+            if ext in parser.extensions:
+                coverage = parser.coverage(filename)
+                break
+        else:
+            continue
 
         for patch in patches:
             to_print = []

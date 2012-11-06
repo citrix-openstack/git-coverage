@@ -12,6 +12,10 @@ SKIP_PATTERNS = [
         'assert_not_reached'
 ]
 
+GIT_DIFF = [
+        'git', 'diff', '--relative'
+]
+
 def subprocess_lines(argv):
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE)
     while True:
@@ -140,8 +144,8 @@ class Patch(object):
     BINARY_FILES_RE = re.compile('Binary files (.*) and (.*) differ\n')
 
     def __init__(self, oldname, newname):
-        self.oldname = oldname
-        self.newname = newname
+        self.oldname = oldname.split("/", 1)[1]
+        self.newname = newname.split("/", 1)[1]
         self.prefix = []
         self.hunks = []
 
@@ -229,7 +233,10 @@ class GccCoverage:
         matches = []
         (directory, base) = os.path.split(filename)
         (base, ext) = os.path.splitext(base)
-        match = "%s/*%s.gcno" % (directory, base)
+        if directory:
+            match = "%s/*%s.gcno" % (directory, base)
+        else:
+            match = "*%s.gcno" % (base, )
         for gcno in self._gcno_cache:
             if fnmatch.fnmatch(gcno, match):
                 matches.append(gcno)
@@ -248,7 +255,8 @@ class GccCoverage:
         (directory, base) = os.path.split(filename)
 
         oldpwd = os.getcwd()
-        os.chdir(directory)
+        if directory:
+            os.chdir(directory)
 
         # We scrape the output of the command for the names of the
         # gcov files created, which we process, and then remove
@@ -465,7 +473,7 @@ def main(argv):
             have_target = True
             break
 
-    cmd = ['git', 'diff'] + argv[1:]
+    cmd = GIT_DIFF + argv[1:]
     if not have_target:
         cmd += ['HEAD']
 
@@ -476,7 +484,7 @@ def main(argv):
 
     # Pull all the patches appart into the hunks that we need
     for patch in Patch.parse(subprocess_lines(cmd)):
-        filename = os.path.normpath(patch.newname.split("/", 1)[1])
+        filename = os.path.normpath(patch.newname)
         if filename not in patches_by_filename:
             patches_by_filename[filename] = []
         patches_by_filename[filename].append(patch)

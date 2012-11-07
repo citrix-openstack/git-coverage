@@ -9,7 +9,10 @@ import sys
 import tempfile
 
 SKIP_PATTERNS = [
-        'assert_not_reached'
+        'assert_not_reached',
+        'return_val_if_reached',
+        'return_if_reached',
+        'UNREACHABLE:'
 ]
 
 GIT_DIFF = [
@@ -24,6 +27,12 @@ def subprocess_lines(argv):
             yield line
         else:
             return
+
+def match_any_re(regexps, line):
+    for regexp in regexps:
+        if regexp.search(line.strip()):
+            return True
+    return False
 
 # ----------------------------------------------------------------------------
 # PATCH PARSING
@@ -212,9 +221,10 @@ class Patch(object):
 class GccCoverage:
     extensions = [".c", ".cpp", ".cc"]
 
-    def __init__(self):
+    def __init__(self, skips):
         self._gcno_cache = []
         self._creating_re = re.compile(".*'(.+\.gcov)'.*")
+        self._skips = skips
 
         def visit(paths, dirname, names):
             for name in names:
@@ -300,7 +310,8 @@ class GccCoverage:
                     count = int(covered)
                 coverage[no] = parts[2]
             except ValueError:
-                pass
+                if match_any_re(self._skips, parts[2]):
+                    coverage[no] = parts[2]
         return coverage
 
     def usage(self, output):
@@ -321,8 +332,9 @@ class GccCoverage:
 class PythonCoverage:
     extensions = [".py"]
 
-    def __init__(self):
+    def __init__(self, skips):
         self._temp_dir = tempfile.mkdtemp(prefix='git-coverage')
+        self._skips = skips
 
     def __del__(self):
         for path in self._list_files():
@@ -340,6 +352,8 @@ class PythonCoverage:
         for line in open(filename, 'r'):
             if not line.startswith("!"):
                 coverage[no] = line
+            elif match_any_re(self._skips, line[1:]):
+                covarege[no] = line
             no += 1
         return coverage
 
@@ -431,15 +445,10 @@ def print_patch_hunks(patch, hunks, coverage, output):
             else:
                 output.write_meta(line, 'diff.plain')
 
-def is_hunk_covered(hunk, coverage, patterns):
+def is_hunk_covered(hunk, coverage):
     for (no, contents) in hunk.lines:
         if no not in coverage:
-            for pattern in patterns:
-                data = contents[1:].strip()
-                if pattern.search(data):
-                    break
-            else:
-                return False
+            return False
     return True
 
 
@@ -458,9 +467,11 @@ def usage(parsers, output=sys.stdout):
 
 
 def main(argv):
+    skips = [re.compile(p) for p in SKIP_PATTERNS]
+
     parsers = (
-            GccCoverage(),
-            PythonCoverage()
+            GccCoverage(skips),
+            PythonCoverage(skips)
     )
 
     have_target = False
@@ -489,9 +500,6 @@ def main(argv):
             patches_by_filename[filename] = []
         patches_by_filename[filename].append(patch)
 
-    # Compile all the skip patterns
-    patterns = [re.compile(p) for p in SKIP_PATTERNS]
-
     # Now go through and calculate coverage
     for (filename, patches) in patches_by_filename.items():
         (name, ext) = os.path.splitext(filename)
@@ -505,7 +513,7 @@ def main(argv):
         for patch in patches:
             to_print = []
             for hunk in patch.hunks:
-                if not is_hunk_covered(hunk, coverage, patterns):
+                if not is_hunk_covered(hunk, coverage):
                     to_print.append(hunk)
             if to_print:
                 print_patch_hunks(patch, to_print, coverage, output)

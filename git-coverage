@@ -34,6 +34,9 @@ def match_any_re(regexps, line):
             return True
     return False
 
+def warning(string):
+    print >> sys.stderr, string
+
 # ----------------------------------------------------------------------------
 # PATCH PARSING
 #
@@ -248,9 +251,20 @@ class GccCoverage:
             match = "%s/*%s.gcno" % (directory, base)
         else:
             match = "*%s.gcno" % (base, )
+        bad_mtime = False
+        mtime = os.path.getmtime(filename)
         for gcno in self._gcno_cache:
             if fnmatch.fnmatch(gcno, match):
-                matches.append(gcno)
+                if os.path.getctime(gcno) < mtime:
+                    bad_mtime = True
+                else:
+                    matches.append(gcno)
+
+        if not matches:
+            if bad_mtime:
+                warning("%s: Found old coverage data, likely not built" % filename)
+            else:
+                warning("%s: Found no coverage data" % filename)
         return matches
 
     def _find_directory_gcno_compiled_in(self, gcno, filename):

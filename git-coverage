@@ -223,7 +223,8 @@ class GccCoverage:
 
     def __init__(self, skips):
         self._gcno_cache = []
-        self._creating_re = re.compile(".*'(.+\.gcov)'.*")
+        self._creating_re = re.compile("^.*'(.+\.gcov)'$")
+        self._file_re = re.compile("^File.*'(.+)'$")
         self._skips = skips
 
         def visit(paths, dirname, names):
@@ -252,20 +253,41 @@ class GccCoverage:
                 matches.append(gcno)
         return matches
 
+    def _find_directory_gcno_compiled_in(self, gcno, filename):
+        cmd = ['gcov', '--preserve-paths', '--relative-only', '--no-output']
+        for line in subprocess_lines(cmd + gcno):
+            match = self._file_re.match(line.strip())
+            if not match:
+                continue
+            expected = match.group(1)
+            if filename.endswith(expected):
+                extra = filename[:-len(expected)]
+                if os.path.exists(extra):
+                    return extra
+            elif expected.endswith(filename):
+                extra = expected[:-len(filename)]
+                up = "../" * len(extra.strip(os.sep).split(os.sep))
+                if os.path.exists(up):
+                    return up
+        return None
+
     def _gcov_lines_for_files(self, filename):
         gcno = self._match_gcno_files(filename)
         if not gcno:
             return
 
-        # gcov wants to be in the directory with the source files
-        # so we make all the gcno paths absolute and change to that
-        # directory
-
         absgcno = [os.path.abspath(path) for path in gcno]
-        (directory, base) = os.path.split(filename)
 
-        oldpwd = os.getcwd()
+        # gcov wants to be in the directory that gcc was executed
+        # from. We don't know which directory that is. So we run
+        # gcov once to figure out the file path it thinks the source
+        # is at.
+
+        directory = self._find_directory_gcno_compiled_in(absgcno, filename)
+
+        oldcwd = None
         if directory:
+            oldcwd = os.getcwd()
             os.chdir(directory)
 
         # We scrape the output of the command for the names of the
@@ -274,7 +296,7 @@ class GccCoverage:
 
         cmd = ['gcov', '--preserve-paths', '--relative-only']
         for line in subprocess_lines(cmd + absgcno):
-            match = self._creating_re.match(line)
+            match = self._creating_re.match(line.strip())
             if not match:
                 continue
             gcov = match.group(1)
@@ -284,7 +306,8 @@ class GccCoverage:
         # Because we change the directory, we have to take care not
         # to yield while the current directory is changed
 
-        os.chdir(oldpwd)
+        if oldcwd:
+            os.chdir(oldcwd)
 
         for gcov in gcovs:
             with open(gcov, 'r') as f:

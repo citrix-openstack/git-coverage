@@ -225,7 +225,8 @@ class GccCoverage:
     extensions = [".c", ".cpp", ".cc"]
 
     def __init__(self, skips):
-        self._gcno_cache = []
+        self._gcno_cache = { }
+        self._gcno_unresolved = [ ]
         self._creating_re = re.compile("^.*'(.+\.gcov)'$")
         self._file_re = re.compile("^File.*'(.+)'$")
         self._skips = skips
@@ -237,97 +238,126 @@ class GccCoverage:
                     continue
                 if not fnmatch.fnmatch(name, "*.gcno"):
                     continue
-                # Skip if no gcda file for this gcno file
-                (base, ext) = os.path.splitext(path)
-                if os.path.exists(base + ".gcda"):
-                    paths.append(path)
-        os.path.walk(".", visit, self._gcno_cache)
+                paths.append(os.path.abspath(path))
+        os.path.walk(".", visit, self._gcno_unresolved)
 
-    def _match_gcno_files(self, filename):
-        matches = []
-        (directory, base) = os.path.split(filename)
+    def _directory_gcno_compiled_in(self, gcno):
+        (directory, base) = os.path.split(gcno)
+
+        # libtool always gets it's grubby little fingers involved
+        (parent, last) = os.path.split(directory)
+        if last == ".libs":
+            return parent
+
+        return directory
+
+    def _add_to_gcno_cache(self, gcno, source):
+        if source not in self._gcno_cache:
+            self._gcno_cache[source] = []
+        self._gcno_cache[source].append(gcno)
+
+    def _lookup_gcno_files(self, filename):
+        source = os.path.abspath(os.path.normpath(filename))
+
+        # Find gcno files that haven't been run through gcov yet
+        # Look for likely candidates that match the source file's
+        # base name.
+
+        (directory, base) = os.path.split(source)
         (base, ext) = os.path.splitext(base)
-        if directory:
-            match = "%s/*%s.gcno" % (directory, base)
-        else:
-            match = "*%s.gcno" % (base, )
-        bad_mtime = False
-        mtime = os.path.getmtime(filename)
-        for gcno in self._gcno_cache:
+        match = "*%s.gcno" % (base, )
+
+        resolve = []
+        for gcno in self._gcno_unresolved:
             if fnmatch.fnmatch(gcno, match):
-                if os.path.getctime(gcno) < mtime:
-                    bad_mtime = True
-                else:
-                    matches.append(gcno)
+                resolve.append(gcno)
+
+        no_gcda = False
+        cmd = ['gcov', '--preserve-paths', '--relative-only', '--no-output']
+        for gcno in resolve:
+            self._gcno_unresolved.remove(gcno)
+
+            # Check if there is a .gcda file for this gcno file
+            # If not, then the compilation unit that created the .gcno
+            # If we don't find any other run .gcno files then we'll
+            # warn about this below, using the flag
+            (base, ext) = os.path.splitext(gcno)
+            if not os.path.exists(base + ".gcda"):
+                no_gcda = True
+                continue
+
+            # Run the gcno file through gcov in the --no-output mode
+            # which will tell us the source file(s) it represents
+            directory = self._directory_gcno_compiled_in(gcno)
+            for line in subprocess_lines(cmd + [gcno]):
+                match = self._file_re.match(line.strip())
+                if not match:
+                    continue
+                filename = match.group(1)
+
+                # We've found a gcno/source combination, make note of it
+                path = os.path.join(directory, filename)
+                self._add_to_gcno_cache(gcno, os.path.normpath(path))
+
+        # Now look through our cache of gcno files that have been run
+        # through gcov, for gcno files that represent the source file
+
+        matches = []
+        bad_mtime = False
+        gcnos = self._gcno_cache.get(source, [])
+        mtime = os.path.getmtime(source)
+        for gcno in gcnos:
+
+            # If the source file has been modified later than the
+            # gcno file this is an indication of not being built
+            # correctly, so get ready to complain about that
+            if os.path.getctime(gcno) < mtime:
+                bad_mtime = True
+                continue
+
+            matches.append(gcno)
 
         if not matches:
             if bad_mtime:
                 warning("%s: Found old coverage data, likely not built" % filename)
+            elif no_gcda:
+                warning("%s: No gcda coverage data found, likely not run" % filename)
             else:
                 warning("%s: Found no coverage data" % filename)
+
         return matches
 
-    def _find_directory_gcno_compiled_in(self, gcno, filename):
-        cmd = ['gcov', '--preserve-paths', '--relative-only', '--no-output']
-        for line in subprocess_lines(cmd + gcno):
-            match = self._file_re.match(line.strip())
-            if not match:
-                continue
-            expected = match.group(1)
-            if filename.endswith(expected):
-                extra = filename[:-len(expected)]
-                if os.path.exists(extra):
-                    return extra
-            elif expected.endswith(filename):
-                extra = expected[:-len(filename)]
-                up = "../" * len(extra.strip(os.sep).split(os.sep))
-                if os.path.exists(up):
-                    return up
-        return None
-
     def _gcov_lines_for_files(self, filename):
-        gcno = self._match_gcno_files(filename)
-        if not gcno:
-            return
+        # We scrape the output of the command for the names of the
+        # gcov files created, which we process, and then remove
 
-        absgcno = [os.path.abspath(path) for path in gcno]
-
-        # gcov wants to be in the directory that gcc was executed
-        # from. We don't know which directory that is. So we run
-        # gcov once to figure out the file path it thinks the source
-        # is at.
-
-        directory = self._find_directory_gcno_compiled_in(absgcno, filename)
-
-        oldcwd = None
-        if directory:
+        for gcno in self._lookup_gcno_files(filename):
+            # Need to run gcov in the same directory compiled in
+            directory = self._directory_gcno_compiled_in(gcno)
             oldcwd = os.getcwd()
             os.chdir(directory)
 
-        # We scrape the output of the command for the names of the
-        # gcov files created, which we process, and then remove
-        gcovs = []
+            gcovs = []
+            cmd = ['gcov', '--preserve-paths', '--relative-only']
+            for line in subprocess_lines(cmd + [gcno]):
+                match = self._creating_re.match(line.strip())
+                if not match:
+                    continue
+                gcov = match.group(1)
+                if os.path.exists(gcov):
+                    gcovs.append(os.path.abspath(gcov))
 
-        cmd = ['gcov', '--preserve-paths', '--relative-only']
-        for line in subprocess_lines(cmd + absgcno):
-            match = self._creating_re.match(line.strip())
-            if not match:
-                continue
-            gcov = match.group(1)
-            if os.path.exists(gcov):
-                gcovs.append(os.path.abspath(gcov))
+            # Because we change the directory, we have to take care not
+            # to yield while the current directory is changed
 
-        # Because we change the directory, we have to take care not
-        # to yield while the current directory is changed
+            if oldcwd:
+                os.chdir(oldcwd)
 
-        if oldcwd:
-            os.chdir(oldcwd)
-
-        for gcov in gcovs:
-            with open(gcov, 'r') as f:
-                for l in f:
-                    yield l
-                os.unlink(gcov)
+            for gcov in gcovs:
+                with open(gcov, 'r') as f:
+                    for l in f:
+                        yield l
+                    os.unlink(gcov)
 
     def coverage(self, filename):
         coverage = { }

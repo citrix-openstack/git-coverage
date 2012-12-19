@@ -420,7 +420,7 @@ class PythonCoverage:
             if not line.startswith("!"):
                 coverage[no] = line
             elif match_any_re(self._skips, line[1:]):
-                covarege[no] = line
+                coverage[no] = line
             no += 1
         return coverage
 

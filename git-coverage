@@ -15,10 +15,6 @@ SKIP_PATTERNS = [
         'UNREACHABLE:'
 ]
 
-GIT_DIFF = [
-        'git', 'diff', '--relative'
-]
-
 def subprocess_lines(argv):
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE)
     while True:
@@ -28,11 +24,26 @@ def subprocess_lines(argv):
         else:
             return
 
+def compile_all_re(patterns):
+    regexps = []
+    for pattern in patterns:
+        regexp = re.compile(pattern)
+        regexps.append(regexp)
+    return regexps
+
+def search_any_re(regexps, line):
+    for regexp in regexps:
+        match = regexp.search(line)
+        if match:
+            return match
+    return None
+
 def match_any_re(regexps, line):
     for regexp in regexps:
-        if regexp.search(line.strip()):
-            return True
-    return False
+        match = regexp.match(line)
+        if match:
+            return match
+    return None
 
 def warning(string):
     print >> sys.stderr, string
@@ -67,17 +78,42 @@ class BadPatch(Exception):
     def __str__(self):
         return self.message
 
+class Line:
+    def __init__(self, old, new, data):
+        self.old = old
+        self.new = new
+        self.data = data
+        self.covered = False
+
 class Hunk:
-    def __init__(self, orig_pos, orig_range, mod_pos, mod_range, header=None):
-        self.orig_pos = orig_pos
-        self.orig_range = orig_range
-        self.mod_pos = mod_pos
-        self.mod_range = mod_range
-        self.header = header
-        self.lines = []
+    def __init__(self, trailer=None, lines=None):
+        self.trailer = trailer
+        self.lines = lines or []
+
+    def ranges(self):
+        orig_pos = 0
+        orig_range = 0
+        mod_pos = 0
+        mod_range = 0
+
+        for line in self.lines:
+            if line.old:
+                if not orig_pos:
+                    orig_pos = line.old
+                orig_range += 1
+            if line.new:
+                if not mod_pos:
+                    mod_pos = line.new
+                mod_range += 1
+        trailer = self.trailer
+        if trailer:
+            trailer = trailer.strip()
+        else:
+            trailer = ""
+        return "@@ -%d,%d +%d,%d @@" % (orig_pos, orig_range, mod_pos, mod_range)
 
     @staticmethod
-    def parse_range(textrange):
+    def _parse_range(textrange):
         tmp = textrange.split(',')
         if len(tmp) == 1:
             pos = tmp[0]
@@ -100,14 +136,14 @@ class Hunk:
         if not orig.startswith('-') or not mod.startswith('+'):
             raise BadPatch("Positions don't start with + or -.", line)
         try:
-            (orig_pos, orig_range) = Hunk.parse_range(orig[1:])
-            (mod_pos, mod_range) = Hunk.parse_range(mod[1:])
+            (orig_pos, orig_range) = Hunk._parse_range(orig[1:])
+            (mod_pos, mod_range) = Hunk._parse_range(mod[1:])
         except (ValueError, IndexError), e:
             raise BadPatch(str(e), line)
         if mod_range < 0 or orig_range < 0:
             raise BadPatch("Hunk range is negative", line)
-        tail = matches.group(3)
-        return Hunk(orig_pos, orig_range, mod_pos, mod_range, line)
+        trailer = matches.group(3)
+        return (Hunk(trailer), orig_pos, orig_range, mod_pos, mod_range)
 
     @staticmethod
     def parse(lines):
@@ -122,7 +158,7 @@ class Hunk:
             if hunk is not None:
                 yield hunk
             try:
-                hunk = Hunk.from_header(line)
+                (hunk, orig_pos, orig_range, mod_pos, mod_range) = Hunk.from_header(line)
             except BadPatch:
                 # If the line isn't a hunk header, then we've reached the end
                 # of this patch and there's "junk" at the end.  Ignore the
@@ -130,24 +166,23 @@ class Hunk:
                 return
             orig_size = 0
             mod_size = 0
-            offset = hunk.mod_pos
-            while orig_size < hunk.orig_range or mod_size < hunk.mod_range:
+            offset = mod_pos
+            while orig_size < orig_range or mod_size < mod_range:
                 hunk_line = lines.next()
                 if hunk_line.startswith("-"):
+                    hunk.lines.append(Line(offset, 0, hunk_line))
                     orig_size += 1
-                elif hunk_line.startswith("\n"):
+                elif hunk_line.startswith("\n") or hunk_line.startswith(" "):
+                    hunk.lines.append(Line(offset, offset, hunk_line))
                     orig_size += 1
                     mod_size += 1
-                elif hunk_line.startswith(" "):
-                    orig_size += 1
-                    mod_size += 1
+                    offset += 1
                 elif hunk_line.startswith("+"):
+                    hunk.lines.append(Line(0, offset, hunk_line))
                     mod_size += 1
+                    offset += 1
                 else:
                     raise BadPatch("Unknown line type: %s" % hunk_line)
-                hunk.lines.append((offset, hunk_line))
-                if not hunk_line.startswith("-"):
-                    offset += 1
         if hunk is not None:
             yield hunk
 
@@ -211,8 +246,7 @@ class Patch(object):
                     yield Patch.parse_one(iter(saved_lines))
                 saved_lines = []
             elif line.startswith('@@'):
-                hunk = Hunk.from_header(line)
-                orig_range = hunk.orig_range
+                (hunk, orig_pos, orig_range, mod_pos, mod_range) = Hunk.from_header(line)
             saved_lines.append(line)
         if len(saved_lines) > 0:
             yield Patch.parse_one(iter(saved_lines))
@@ -230,6 +264,12 @@ class GccCoverage:
         self._creating_re = re.compile("^.*'(.+\.gcov)'$")
         self._file_re = re.compile("^File.*'(.+)'$")
         self._skips = skips
+        self._trailer_res = compile_all_re([
+            # C/++ functions/methods at top level
+            r"^\b[\w_]+\b(\s*::)?[\s*]*\([\w_*\s,\)\{]*$",
+            # compound type at top level
+            r"^(struct|class|enum)[^;]*$"
+        ])
 
         def visit(paths, dirname, names):
             for name in names:
@@ -377,9 +417,13 @@ class GccCoverage:
                     count = int(covered)
                 coverage[no] = parts[2]
             except ValueError:
-                if match_any_re(self._skips, parts[2]):
+                if search_any_re(self._skips, parts[2]):
                     coverage[no] = parts[2]
         return coverage
+
+    def trailer(self, string):
+        match = match_any_re(self._trailer_res, string)
+        return match and match.group(0) or None
 
     def usage(self, output):
         string = """GCC gcov C code coverage
@@ -402,6 +446,7 @@ class PythonCoverage:
     def __init__(self, skips):
         self._temp_dir = tempfile.mkdtemp(prefix='git-coverage')
         self._skips = skips
+        self._trailer_re = re.compile("^[ \t]*((class|def)[ \t].*)$")
 
     def __del__(self):
         for path in self._list_files():
@@ -419,7 +464,7 @@ class PythonCoverage:
         for line in open(filename, 'r'):
             if not line.startswith("!"):
                 coverage[no] = line
-            elif match_any_re(self._skips, line[1:]):
+            elif search_any_re(self._skips, line[1:]):
                 coverage[no] = line
             no += 1
         return coverage
@@ -437,6 +482,10 @@ class PythonCoverage:
             os.unlink(path)
 
         return coverage
+
+    def trailer(self, string):
+        match = self._trailer_re.match(string)
+        return match and match.group(0) or None
 
     def usage(self, output):
         string = """Python code coverage
@@ -464,13 +513,18 @@ class Output:
             'diff.problem': 'normal red'
     }
 
-    def __init__(self, output):
+    def __init__(self, output, with_colors, context=3, cover_context=False):
         self.output = output
         self.escapes = { }
+        self.context = context
+        self.cover_context = cover_context
 
-        cmd = ['git', 'config', '--get-colorbool',
-               'color.diff', output.isatty() and 'true' or 'false']
-        self.with_colors = subprocess.check_output(cmd).strip() == 'true'
+        if with_colors is None:
+            cmd = ['git', 'config', '--get-colorbool',
+                   'color.diff', output.isatty() and 'true' or 'false']
+            self.with_colors = subprocess.check_output(cmd).strip() == 'true'
+        else:
+            self.with_colors = with_colors
 
     def write_meta(self, data, meta):
         if not self.with_colors:
@@ -495,29 +549,105 @@ class Output:
 
 # ----------------------------------------------------------------------------
 
+def prepare_uncovered_hunks(ihunk, parser, coverage, output):
+    # for line in ihunk.lines:
+    #     line.covered = False
+    # yield ihunk
+    # return
+
+    context = output.context
+
+    lines = []
+    since = 0
+    have = False
+    trailer = ihunk.trailer
+
+    for line in ihunk.lines:
+
+        # We look for function name frag trailers for each line so that
+        # can use them for chunks that start after this line
+        line.trailer = parser.trailer(line.data[1:])
+        line.covered = True
+
+        # In cover context mode we check all the lines in
+        # the patch for coverage, regardless of whether they
+        # were added, removed or not touched
+        if output.cover_context:
+            if line.old and line.old not in coverage:
+                line.covered = False
+            elif line.new and line.new not in coverage:
+                line.covered = False
+
+        # In the default mode we only check new lines for coverage
+        else:
+            if not line.old and line.new and line.new not in coverage:
+                line.covered = False
+
+        lines.append(line)
+
+        if not line.covered:
+            # If a line is uncovered then add, and start counting the lines
+            # that come after this one as trailing context
+            since = 0
+            have = True
+
+        elif have:
+            since += 1
+
+            # So once we have more than twice the trailing context as necessary
+            # then we break this off into its own chuck, only consuming as
+            # half of the trailing context lines added.
+            if since > context * 2:
+                pos = len(lines) - (since - context)
+                hunk = Hunk(trailer, lines[0:pos])
+
+                # Choose a function name frag from within this hunk
+                # for the next hunk, if we found a new one for a certain line
+                for line in hunk.lines:
+                    if line.trailer:
+                        trailer = line.trailer
+
+                yield hunk
+                lines = lines[pos:]
+                since = 0
+                have = False
+
+        if not have:
+            # If there are too many prefix context lines, then go ahead and
+            # drop one, looking for the function frag name to use for next hunk
+            if len(lines) > context:
+                drop = lines.pop(0)
+                if drop.trailer:
+                    trailer = drop.trailer
+
+    if have:
+        if since > context:
+            pos = len(lines) - (since - context)
+            hunk = Hunk(trailer, lines[0:pos])
+        else:
+            hunk = Hunk(trailer, lines)
+        yield hunk
+
+def print_hunk_lines(hunk, coverage, output):
+    output.write_meta(hunk.ranges(), 'diff.frag')
+    output.write_meta(" %s\n" % (hunk.trailer or "").strip(), 'diff.plain')
+    for line in hunk.lines:
+        if line.covered:
+            output.write(" ")
+        else:
+            output.write_meta("!", 'diff.problem')
+        if not line.new:
+            output.write_meta(line.data, 'diff.old')
+        elif not line.old:
+            output.write_meta(line.data, 'diff.new')
+        else:
+            output.write_meta(line.data, 'diff.plain')
+
 def print_patch_hunks(patch, hunks, coverage, output):
     for line in patch.prefix:
         output.write_meta(line, 'diff.meta')
     for hunk in hunks:
-        output.write_meta(hunk.header, 'diff.frag')
-        for (no, line) in hunk.lines:
-            if no in coverage:
-                output.write(" ")
-            else:
-                output.write_meta("!", 'diff.problem')
-            if line.startswith("-"):
-                output.write_meta(line, 'diff.old')
-            elif line.startswith("+"):
-                output.write_meta(line, 'diff.new')
-            else:
-                output.write_meta(line, 'diff.plain')
-
-def is_hunk_covered(hunk, coverage):
-    for (no, contents) in hunk.lines:
-        if no not in coverage:
-            return False
-    return True
-
+        print_hunk_lines(hunk, coverage, output)
 
 def usage(parsers, output=sys.stdout):
     string = """usage: git coverage [diff-options] commit
@@ -532,30 +662,111 @@ def usage(parsers, output=sys.stdout):
         output.write("\n")
         parser.usage(output=output)
 
+def getopt_keep_dashes(argv, short, long):
+    # Split off everything after the -- argument
+    try:
+        double_dash = argv.index("--", 1)
+        before_dashes = argv[0:double_dash]
+        after_dashes = argv[double_dash:]
+    except ValueError:
+        before_dashes = argv
+        after_dashes = []
+
+    opts, args = getopt.getopt(before_dashes, short, long)
+    args += after_dashes
+    return opts, args
 
 def main(argv):
-    skips = [re.compile(p) for p in SKIP_PATTERNS]
+    skips = compile_all_re(SKIP_PATTERNS)
 
     parsers = (
             GccCoverage(skips),
             PythonCoverage(skips)
     )
 
+    short = "abC:G:l:pO:M:S:uU:W"
+
+    long = (
+        "help",
+        "cover-context",
+
+        "color",
+        "color=",
+        "diff-filter=",
+        "exit-code",
+        "find-renames",
+        "find-renames=",
+        "find-copies",
+        "find-copies=",
+        "find-copies-hander",
+        "function-context",
+        "histogram",
+        "ignore-all-space",
+        "ignore-space-at-eol",
+        "ignore-space-change",
+        "inter-hunk-context",
+        "minimal",
+        "no-color",
+        "patch",
+        "patience",
+        "pickaxe-all",
+        "pickaxe-regex",
+        "unified=",
+        "text",
+    )
+
+    try:
+        opts, args = getopt_keep_dashes(argv[1:], short, long)
+    except getopt.GetoptError as err:
+        print str(err)
+        return 2
+
     have_target = False
-    for arg in argv[1:]:
-        if arg in ('-h', '--help'):
+    context = 3
+    cover_context = False
+    with_colors = None
+
+    cmd = [
+        'git', '--no-pager', 'diff', '--relative', '--no-color',
+    ]
+
+    for o, a in opts:
+        # git-coverage specific options
+        if o in ('-h', '--help'):
             usage(parsers)
             return 0
+        elif o in ("--cover-context"):
+            cover_context = True
+        elif o in ("--color"):
+            if not a or a in ("always"):
+                with_colors = True
+            elif a in ("never"):
+                with_colors = False
+            elif a in ("auto"):
+                with_colors = None
+            continue
+        elif o in ("--no-color"):
+            with_colors = False
+            continue
 
-        if not arg.startswith("-"):
-            have_target = True
-            break
+        # Take note of these, and then pass through
+        if o in ('-U', "--unified"):
+            context = int(a)
+        elif o in ("-W", "--function-context"):
+            context = 1024 * 1024 * 1024  # Big but still usable in calculations
 
-    cmd = GIT_DIFF + argv[1:]
-    if not have_target:
+        # Pass through all other options
+        if not a:
+            cmd += [o]
+        else:
+            cmd += [o, a]
+
+    if args:
+        cmd += args
+    else:
         cmd += ['HEAD']
 
-    output = Output(sys.stdout)
+    output = Output(sys.stdout, with_colors, context, cover_context)
 
     printed_any = 0
     patches_by_filename = { }
@@ -579,8 +790,8 @@ def main(argv):
 
         for patch in patches:
             to_print = []
-            for hunk in patch.hunks:
-                if not is_hunk_covered(hunk, coverage):
+            for ihunk in patch.hunks:
+                for hunk in prepare_uncovered_hunks(ihunk, parser, coverage, output):
                     to_print.append(hunk)
             if to_print:
                 print_patch_hunks(patch, to_print, coverage, output)

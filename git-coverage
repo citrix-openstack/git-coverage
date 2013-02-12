@@ -477,7 +477,7 @@ class PythonCoverage:
         base = os.path.basename(filename)
 
         for path in self._list_files():
-            if not coverage and fnmatch.fnmatch(path, "*_%s,cover" % base):
+            if not coverage and fnmatch.fnmatch(path, "*%s*" % base):
                 coverage = self._read_coverage(path)
             os.unlink(path)
 

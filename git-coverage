@@ -181,6 +181,8 @@ class Hunk:
                     hunk.lines.append(Line(0, offset, hunk_line))
                     mod_size += 1
                     offset += 1
+                elif hunk_line.startswith("\\"):
+                    pass # No newline at end of file
                 else:
                     raise BadPatch("Unknown line type: %s" % hunk_line)
         if hunk is not None:

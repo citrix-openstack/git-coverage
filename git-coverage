@@ -315,7 +315,7 @@ class GccCoverage:
                 resolve.append(gcno)
 
         no_gcda = False
-        cmd = ['gcov', '--preserve-paths', '--relative-only', '--no-output']
+        cmd = ['gcov', '--preserve-paths', '--no-output']
         for gcno in resolve:
             self._gcno_unresolved.remove(gcno)
 
@@ -380,7 +380,7 @@ class GccCoverage:
             os.chdir(directory)
 
             gcovs = []
-            cmd = ['gcov', '--preserve-paths', '--relative-only']
+            cmd = ['gcov', '--preserve-paths']
             for line in subprocess_lines(cmd + [gcno]):
                 match = self._creating_re.match(line.strip())
                 if not match:

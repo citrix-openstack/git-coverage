@@ -347,7 +347,9 @@ class GccCoverage:
         matches = []
         bad_mtime = False
         gcnos = self._gcno_cache.get(source, [])
-        mtime = os.path.getmtime(source)
+        mtime = 0
+        if os.path.exists(source):
+            mtime = os.path.getmtime(source)
         for gcno in gcnos:
 
             # If the source file has been modified later than the

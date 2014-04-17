@@ -283,15 +283,24 @@ class GccCoverage:
                 paths.append(os.path.abspath(path))
         os.path.walk(".", visit, self._gcno_unresolved)
 
-    def _directory_gcno_compiled_in(self, gcno):
-        (directory, base) = os.path.split(gcno)
+    def _directory_gcno_compiled_in(self, gcno, source):
+        (directory, unused) = os.path.split(gcno)
+        (srcdir, unused) = os.path.split(source)
 
-        # libtool always gets it's grubby little fingers involved
-        (parent, last) = os.path.split(directory)
-        if last == ".libs":
-            return parent
+        # Remove any common bits from gcno and source
+        # paths to account for automake subdir-objects
+        while True:
+            (parent, last) = os.path.split(directory)
+            (sparent, slast) = os.path.split(srcdir)
 
-        return directory
+            # libtool always gets it's grubby little fingers involved
+            if last == ".libs":
+                directory = parent
+            elif last == slast:
+                directory = parent
+                srcdir = sparent
+            else:
+                return directory
 
     def _add_to_gcno_cache(self, gcno, source):
         if source not in self._gcno_cache:
@@ -330,12 +339,13 @@ class GccCoverage:
 
             # Run the gcno file through gcov in the --no-output mode
             # which will tell us the source file(s) it represents
-            directory = self._directory_gcno_compiled_in(gcno)
             for line in subprocess_lines(cmd + [gcno]):
                 match = self._file_re.match(line.strip())
                 if not match:
                     continue
                 filename = match.group(1)
+
+                directory = self._directory_gcno_compiled_in(gcno, filename)
 
                 # We've found a gcno/source combination, make note of it
                 path = os.path.join(directory, filename)
@@ -377,7 +387,7 @@ class GccCoverage:
 
         for gcno in self._lookup_gcno_files(filename):
             # Need to run gcov in the same directory compiled in
-            directory = self._directory_gcno_compiled_in(gcno)
+            directory = self._directory_gcno_compiled_in(gcno, filename)
             oldcwd = os.getcwd()
             os.chdir(directory)
 

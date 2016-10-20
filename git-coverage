@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import ConfigParser
 import fnmatch
 import getopt
 import os
@@ -690,6 +691,22 @@ def getopt_keep_dashes(argv, short, long):
     args += after_dashes
     return opts, args
 
+def read_coveragerc(coveragerc, section, key):
+    if not os.path.exists(coveragerc):
+        return None
+    config = ConfigParser.SafeConfigParser()
+    config.read(coveragerc)
+    if not config.has_section(section):
+        return None
+    return config.get(section, key, None)
+
+def get_omit_patterns():
+    omit = read_coveragerc(".coveragerc", "run", "omit")
+    if omit:
+        return omit.split(",")
+    else:
+        return []
+
 def main(argv):
     skips = compile_all_re(SKIP_PATTERNS)
 
@@ -792,8 +809,15 @@ def main(argv):
             patches_by_filename[filename] = []
         patches_by_filename[filename].append(patch)
 
+    omit_patterns = get_omit_patterns()
     # Now go through and calculate coverage
     for (filename, patches) in patches_by_filename.items():
+        if any([fnmatch.fnmatch(filename, omit_pattern)
+            for omit_pattern in omit_patterns]):
+            # print skipped file in yellow
+            print "SKIPPING FILE: %s" % filename
+            continue
+
         (name, ext) = os.path.splitext(filename)
         for parser in parsers:
             if ext in parser.extensions:
@@ -810,6 +834,13 @@ def main(argv):
             if to_print:
                 print_patch_hunks(patch, to_print, coverage, output)
                 printed_any = 1
+
+        if all([line.new in coverage
+                for line in ihunk.lines
+                for ihunk in patch.hunks
+                for patch in patches]):
+            # print fully covered file in blue
+            print "FULLY COVERED FILE: %s" % filename
 
     return printed_any
 

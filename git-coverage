@@ -698,7 +698,9 @@ def read_coveragerc(coveragerc, section, key):
     config.read(coveragerc)
     if not config.has_section(section):
         return None
-    return config.get(section, key, None)
+    if not config.has_option(section, key):
+        return None
+    return config.get(section, key)
 
 def get_omit_patterns():
     omit = read_coveragerc(".coveragerc", "run", "omit")
